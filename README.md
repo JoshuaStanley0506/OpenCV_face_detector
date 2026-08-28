@@ -21,7 +21,7 @@ A modular, real-time computer vision application combining classical feature cas
 ## 🤝 Authorship & Acknowledgements
 
 - **Joshua Stanley George** — Project design, integration, testing, code review, and conceptual understanding.
-- **AI Collaboration (Google Antigravity)** — Assisted with the implementation details, MediaPipe 1.0 Tasks API migration, and pipeline consolidation.
+- **AI Collaboration (Codex)** — Assisted with the implementation details, MediaPipe 1.0 Tasks API migration, and pipeline consolidation.
 
 > *"Built through iterative human-AI collaboration — with code thoroughly studied, debugged, and reviewed for production understanding."*
 
