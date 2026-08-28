@@ -2,7 +2,6 @@ import os
 import cv2
 import time
 
-# Directory setup
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 os.makedirs("snapshots", exist_ok=True)
 
@@ -13,16 +12,14 @@ def load_cascade(filename):
         raise FileNotFoundError(f"Missing classifier: {path}")
     return cascade
 
-# 1. Load Classifiers
+
 face_cascade = load_cascade('facedetector_frontalface_default.xml')
 eye_cascade = load_cascade('facedetector_eye.xml')
 smile_cascade = load_cascade('facedetector_smile.xml')
 
-# 2. Camera Setup
 cap = cv2.VideoCapture(0)
 
-# Filter State Management
-# Mode 0: Normal | Mode 1: Thermal | Mode 2: Edges | Mode 3: Cartoon | Mode 4: Grayscale
+
 current_filter = 0
 filter_names = {
     0: "Normal",
@@ -38,17 +35,16 @@ snapshot_counter = 0
 
 def apply_cartoon(img):
     """Creates a cel-shaded cartoon effect using bilateral filtering and edge masking."""
-    # 1. Edge mask
     gray_img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     gray_blur = cv2.medianBlur(gray_img, 5)
     edges = cv2.adaptiveThreshold(
         gray_blur, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY, 9, 9
     )
     
-    # 2. Color smoothing (bilateral filter keeps edges sharp)
+    
     color = cv2.bilateralFilter(img, d=9, sigmaColor=250, sigmaSpace=250)
     
-    # 3. Combine smoothed color with edge mask
+    
     edges_bgr = cv2.cvtColor(edges, cv2.COLOR_GRAY2BGR)
     cartoon = cv2.bitwise_and(color, edges_bgr)
     return cartoon
@@ -69,15 +65,15 @@ while True:
     if not ret:
         break
 
-    # Calculate FPS
+    
     new_frame_time = time.time()
     fps = 1 / (new_frame_time - prev_frame_time) if (new_frame_time - prev_frame_time) > 0 else 0
     prev_frame_time = new_frame_time
 
-    # Detection operates on standard grayscale for reliability
+    
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-    # Detect faces
+
     faces = face_cascade.detectMultiScale(
         gray,
         scaleFactor=1.2,
