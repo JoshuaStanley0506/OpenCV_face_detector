@@ -4,8 +4,6 @@ from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 import math
 import time
-
-# Standard 21-landmark hand connections
 HAND_CONNECTIONS = [
     (0, 1), (1, 2), (2, 3), (3, 4),           # Thumb
     (0, 5), (5, 6), (6, 7), (7, 8),           # Index
@@ -33,7 +31,7 @@ def count_fingers(landmarks, handedness_label):
 
     return fingers
 
-# Configure Hand Landmarker Task
+
 base_options = python.BaseOptions(model_asset_path="hand_landmarker.task")
 options = vision.HandLandmarkerOptions(
     base_options=base_options,
@@ -124,7 +122,7 @@ with vision.HandLandmarker.create_from_options(options) as landmarker:
                 cv2.putText(frame, f"{handedness_label}: {gesture} ({extended_count})",
                             (wrist_x - 40, wrist_y + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
-        # Top HUD
+        
         cv2.putText(frame, f"FPS: {int(fps)}", (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
         cv2.putText(frame, f"Fingers Raised: {total_fingers}", (20, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
