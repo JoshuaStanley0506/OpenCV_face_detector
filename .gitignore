@@ -1,3 +1,9 @@
 venv/
 __pycache__/
 *.pyc
+venv/
+snapshots/
+*.task
+*.joblib
+gesture_data.csv
+__pycache__/

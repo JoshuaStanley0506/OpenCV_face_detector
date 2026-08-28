@@ -2,6 +2,7 @@ import os
 import cv2
 import time
 import math
+import joblib
 import mediapipe as mp
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
@@ -11,6 +12,9 @@ from mediapipe.tasks.python import vision
 # -------------------------------------------------------------------------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 os.makedirs(os.path.join(BASE_DIR, "snapshots"), exist_ok=True)
+
+MODEL_FILE = os.path.join(BASE_DIR, "gesture_model.joblib")
+TASK_FILE = os.path.join(BASE_DIR, "hand_landmarker.task")
 
 HAND_CONNECTIONS = [
     (0, 1), (1, 2), (2, 3), (3, 4),           # Thumb
@@ -41,7 +45,6 @@ class AdvancedFaceDetector:
         return cascade
 
     def process(self, frame, gray, blur_mode=False):
-        """Processes face bounding boxes, eye tracking, and expression detection."""
         faces = self.face_cascade.detectMultiScale(
             gray,
             scaleFactor=1.2,
@@ -51,7 +54,6 @@ class AdvancedFaceDetector:
 
         for i, (x, y, w, h) in enumerate(faces):
             if blur_mode:
-                # Anonymize face area
                 face_roi = frame[y:y+h, x:x+w]
                 if face_roi.size > 0:
                     blurred_face = cv2.GaussianBlur(face_roi, (51, 51), 30)
@@ -59,10 +61,9 @@ class AdvancedFaceDetector:
                 cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 140, 255), 2)
                 cv2.putText(frame, "ANONYMIZED", (x, y - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 140, 255), 2)
             else:
-                # 1. Face Box
                 cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
 
-                # 2. Eye Detection
+                # Eye Tracking
                 roi_gray = gray[y:y+h, x:x+w]
                 roi_frame = frame[y:y+h, x:x+w]
                 eyes = self.eye_cascade.detectMultiScale(
@@ -71,7 +72,7 @@ class AdvancedFaceDetector:
                 for (ex, ey, ew, eh) in eyes:
                     cv2.rectangle(roi_frame, (ex, ey), (ex + ew, ey + eh), (255, 0, 0), 1)
 
-                # 3. Smile & Expression Detection (Lower Face ROI)
+                # Smile & Expression Detection
                 roi_gray_lower = roi_gray[int(h / 2):h, 0:w]
                 roi_frame_lower = roi_frame[int(h / 2):h, 0:w]
                 smiles = self.smile_cascade.detectMultiScale(
@@ -93,18 +94,17 @@ class AdvancedFaceDetector:
         return frame, faces
 
 # -------------------------------------------------------------------------
-# 3. Hand Tracker & Gesture Classifier Module
+# 3. Hand Tracker & ML Classifier Module
 # -------------------------------------------------------------------------
-class AdvancedHandTracker:
-    def __init__(self, model_filename="hand_landmarker.task"):
-        model_path = os.path.join(BASE_DIR, model_filename)
-        if not os.path.exists(model_path):
+class MLHandTracker:
+    def __init__(self, task_path=TASK_FILE, model_path=MODEL_FILE):
+        if not os.path.exists(task_path):
             raise FileNotFoundError(
-                f"Missing '{model_path}'. Download it via: "
+                f"Missing '{task_path}'. Download it via: "
                 "wget -q https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task"
             )
 
-        base_options = python.BaseOptions(model_asset_path=model_path)
+        base_options = python.BaseOptions(model_asset_path=task_path)
         options = vision.HandLandmarkerOptions(
             base_options=base_options,
             running_mode=vision.RunningMode.VIDEO,
@@ -115,15 +115,31 @@ class AdvancedHandTracker:
         )
         self.landmarker = vision.HandLandmarker.create_from_options(options)
 
-    def _count_fingers(self, landmarks, handedness_label):
+        # Load Scikit-Learn Model if available
+        self.clf = None
+        if os.path.exists(model_path):
+            self.clf = joblib.load(model_path)
+            print(f"[+] Loaded ML Gesture Model from '{model_path}'")
+        else:
+            print("[-] 'gesture_model.joblib' not found. Falling back to heuristic mode.")
+
+    def _extract_relative_features(self, landmarks):
+        """Extracts 42 translation-invariant features relative to landmark 0 (wrist)."""
+        base_x = landmarks[0].x
+        base_y = landmarks[0].y
+        features = []
+        for lm in landmarks:
+            features.append(lm.x - base_x)
+            features.append(lm.y - base_y)
+        return [features]
+
+    def _count_fingers_fallback(self, landmarks, handedness_label):
         fingers = []
-        # Thumb: compare X coordinates based on handedness
         if handedness_label == 'Right':
             fingers.append(1 if landmarks[4].x < landmarks[3].x else 0)
         else:
             fingers.append(1 if landmarks[4].x > landmarks[3].x else 0)
 
-        # 4 Fingers: tip Y compared to PIP joint (tip - 2)
         for tip_id in TIP_IDS:
             fingers.append(1 if landmarks[tip_id].y < landmarks[tip_id - 2].y else 0)
         return fingers
@@ -133,7 +149,9 @@ class AdvancedHandTracker:
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=raw_frame_rgb)
         results = self.landmarker.detect_for_video(mp_image, timestamp_ms)
 
-        total_fingers = 0
+        active_prediction = None
+        active_confidence = 0.0
+
         if results.hand_landmarks:
             for idx, landmarks in enumerate(results.hand_landmarks):
                 handedness_label = results.handedness[idx][0].category_name
@@ -149,20 +167,34 @@ class AdvancedHandTracker:
                     cx, cy = int(lm.x * w), int(lm.y * h)
                     cv2.circle(display_frame, (cx, cy), 4, (0, 0, 255), cv2.FILLED)
 
-                # 3. Finger Count & Gesture Logic
-                finger_states = self._count_fingers(landmarks, handedness_label)
-                extended_count = sum(finger_states)
-                total_fingers += extended_count
+                # 3. Gesture Classification (ML vs Fallback)
+                label_text = "Unknown"
+                if self.clf:
+                    features = self._extract_relative_features(landmarks)
+                    pred = self.clf.predict(features)[0]
+                    probs = self.clf.predict_proba(features)[0]
+                    conf = max(probs)
 
-                gesture = "Unknown"
-                if extended_count == 0:
-                    gesture = "Fist"
-                elif extended_count == 5:
-                    gesture = "Open Hand"
-                elif finger_states == [0, 1, 1, 0, 0]:
-                    gesture = "Peace / Victory"
+                    if conf > 0.65:
+                        label_text = f"Letter: {pred} ({int(conf * 100)}%)"
+                        active_prediction = pred
+                        active_confidence = conf
+                    else:
+                        label_text = "Uncertain..."
+                else:
+                    # Heuristic fallback
+                    finger_states = self._count_fingers_fallback(landmarks, handedness_label)
+                    count = sum(finger_states)
+                    if count == 0:
+                        label_text = "Fist"
+                    elif count == 5:
+                        label_text = "Open Hand"
+                    elif finger_states == [0, 1, 1, 0, 0]:
+                        label_text = "Peace"
+                    else:
+                        label_text = f"Fingers: {count}"
 
-                # 4. Pinch Measurement (Thumb Tip #4 to Index Tip #8)
+                # 4. Pinch Measurement
                 x1, y1 = int(landmarks[4].x * w), int(landmarks[4].y * h)
                 x2, y2 = int(landmarks[8].x * w), int(landmarks[8].y * h)
                 cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
@@ -171,16 +203,15 @@ class AdvancedHandTracker:
                 cv2.circle(display_frame, (x1, y1), 6, (255, 0, 0), cv2.FILLED)
                 cv2.circle(display_frame, (x2, y2), 6, (255, 0, 0), cv2.FILLED)
 
-                pinch_dist = math.hypot(x2 - x1, y2 - y1)
-                if pinch_dist < 30:
+                if math.hypot(x2 - x1, y2 - y1) < 30:
                     cv2.circle(display_frame, (cx, cy), 10, (0, 255, 0), cv2.FILLED)
 
-                # 5. Hand Info Tag at Wrist (#0)
+                # 5. Hand Info Tag
                 wrist_x, wrist_y = int(landmarks[0].x * w), int(landmarks[0].y * h)
-                cv2.putText(display_frame, f"{handedness_label}: {gesture} ({extended_count})",
+                cv2.putText(display_frame, f"{handedness_label}: {label_text}",
                             (wrist_x - 40, wrist_y + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
-        return display_frame, total_fingers
+        return display_frame, active_prediction, active_confidence
 
     def close(self):
         self.landmarker.close()
@@ -204,7 +235,7 @@ def apply_cartoon(img):
 def main():
     cap = cv2.VideoCapture(0)
     face_detector = AdvancedFaceDetector()
-    hand_tracker = AdvancedHandTracker("hand_landmarker.task")
+    hand_tracker = MLHandTracker()
 
     current_filter = 0
     filter_names = {
@@ -221,6 +252,12 @@ def main():
     snapshot_counter = 0
     prev_frame_time = 0
 
+    # Word building state
+    spelled_text = ""
+    last_detected_char = None
+    stable_frames = 0
+    CONFIRMATION_FRAMES = 18  # ~0.6 sec hold to commit letter
+
     print("\n================== Controls ==================")
     print(" [1] : Normal Vision")
     print(" [2] : Thermal / Heatmap Vision")
@@ -231,6 +268,9 @@ def main():
     print(" [h] : Toggle Hand Tracking ON/OFF")
     print(" [b] : Toggle Face Blur (Privacy)")
     print(" [s] : Save Face Snapshot")
+    print(" [Spacebar]  : Add space to spelled word")
+    print(" [Backspace] : Delete last character")
+    print(" [c] : Clear spelled text")
     print(" [q] : Quit Application")
     print("==============================================\n")
 
@@ -239,14 +279,13 @@ def main():
         if not ret:
             break
 
-        # Flip horizontally for natural mirror view
         frame = cv2.flip(frame, 1)
+        h, w, _ = frame.shape
 
-        # Baseline frames for processing
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         rgb_raw = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-        # 1. Apply Selected Visual Filter
+        # 1. Apply Filters
         if current_filter == 1:
             display_frame = cv2.applyColorMap(gray, cv2.COLORMAP_JET)
         elif current_filter == 2:
@@ -264,32 +303,52 @@ def main():
         if enable_face:
             display_frame, faces = face_detector.process(display_frame, gray, blur_mode)
 
-        total_fingers = 0
+        pred_char = None
+        conf = 0.0
         if enable_hands:
             timestamp_ms = int(time.time() * 1000)
-            display_frame, total_fingers = hand_tracker.process(display_frame, rgb_raw, timestamp_ms)
+            display_frame, pred_char, conf = hand_tracker.process(display_frame, rgb_raw, timestamp_ms)
+
+            # Character Debounce & Word Assembly
+            if pred_char and pred_char == last_detected_char:
+                stable_frames += 1
+                if stable_frames == CONFIRMATION_FRAMES:
+                    spelled_text += pred_char
+            else:
+                last_detected_char = pred_char
+                stable_frames = 0
 
         # 3. FPS Calculation
         now = time.time()
         fps = int(1 / (now - prev_frame_time)) if (now - prev_frame_time) > 0 else 0
         prev_frame_time = now
 
-        # 4. HUD / Status Overlay
+        # 4. Top HUD Overlays
         cv2.putText(display_frame, f"FPS: {fps}", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
         cv2.putText(display_frame, f"Filter: {filter_names[current_filter]}", (20, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
 
-        face_hud_col = (0, 255, 0) if enable_face else (128, 128, 128)
-        cv2.putText(display_frame, f"Face [F]: {'ON' if enable_face else 'OFF'} ({len(faces)})", (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.6, face_hud_col, 2)
+        face_col = (0, 255, 0) if enable_face else (128, 128, 128)
+        cv2.putText(display_frame, f"Face [F]: {'ON' if enable_face else 'OFF'} ({len(faces)})", (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.6, face_col, 2)
 
-        hand_hud_col = (0, 255, 0) if enable_hands else (128, 128, 128)
-        cv2.putText(display_frame, f"Hands [H]: {'ON' if enable_hands else 'OFF'} (Fingers: {total_fingers})", (20, 105), cv2.FONT_HERSHEY_SIMPLEX, 0.6, hand_hud_col, 2)
+        hand_col = (0, 255, 0) if enable_hands else (128, 128, 128)
+        mode_label = "ML Model" if hand_tracker.clf else "Heuristic"
+        cv2.putText(display_frame, f"Hands [H]: {'ON' if enable_hands else 'OFF'} ({mode_label})", (20, 105), cv2.FONT_HERSHEY_SIMPLEX, 0.6, hand_col, 2)
 
-        blur_hud_col = (0, 140, 255) if blur_mode else (180, 180, 180)
-        cv2.putText(display_frame, f"Blur [B]: {'ON' if blur_mode else 'OFF'}", (20, 130), cv2.FONT_HERSHEY_SIMPLEX, 0.6, blur_hud_col, 2)
+        # 5. Bottom Word Speller & Confirmation Progress Bar
+        if enable_hands and hand_tracker.clf:
+            # Letter confirmation progress bar
+            progress = min(stable_frames / CONFIRMATION_FRAMES, 1.0)
+            bar_w = int(progress * 150)
+            cv2.rectangle(display_frame, (20, 120), (20 + bar_w, 128), (0, 255, 0), cv2.FILLED)
+            cv2.rectangle(display_frame, (20, 120), (170, 128), (255, 255, 255), 1)
+
+            # Spelled Text Banner at bottom
+            cv2.rectangle(display_frame, (10, h - 60), (w - 10, h - 10), (25, 25, 25), cv2.FILLED)
+            cv2.putText(display_frame, f"Word: {spelled_text}", (25, h - 25), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
 
         cv2.imshow('Unified Vision Suite', display_frame)
 
-        # 5. Keyboard Handling
+        # 6. Key Handlers
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q'):
             break
@@ -309,9 +368,14 @@ def main():
             enable_hands = not enable_hands
         elif key == ord('b'):
             blur_mode = not blur_mode
+        elif key == 32:    # Space
+            spelled_text += " "
+        elif key == 8:     # Backspace
+            spelled_text = spelled_text[:-1]
+        elif key == ord('c'):
+            spelled_text = ""
         elif key == ord('s') and len(faces) > 0:
             fx, fy, fw, fh = faces[0]
-            # Save unblurred original crop
             snapshot_img = frame[fy:fy+fh, fx:fx+fw]
             save_path = os.path.join(BASE_DIR, "snapshots", f"face_{snapshot_counter}.jpg")
             cv2.imwrite(save_path, snapshot_img)
